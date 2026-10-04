@@ -1,0 +1,378 @@
+name: docker-image-builder
+
+# 手动触发的 Docker Image Builder：读取 vars.BUILD_MATRIX 矩阵配置，
+# 按每项 dockerfile.mode（inline / url）获取完整 Dockerfile，
+# 外部文件、Git 仓库、归档解压等一切准备工作由 pre_build 自定义命令完成，
+# 构建在 context 字段指定的目录中执行，多镜像并发构建并推送 ACR。
+# 保密环境变量走聚合 Secret（secrets.SECRET_ENV，每行 KEY=value），
+# 由 Load secret env block 步骤展开，pre_build 与 Dockerfile 均可引用。
+# 字段规范与使用示例见 README。
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-image-builder
+  cancel-in-progress: false
+
+env:
+  BUILD_TIMEOUT_MINUTES: ${{ vars.BUILD_TIMEOUT_MINUTES || '60' }}
+
+jobs:
+  # ---- 1. 读取矩阵并严格校验 ----
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+    steps:
+      - name: Compute and Validate Build Matrix
+        id: build-matrix
+        env:
+          BUILD_MATRIX: ${{ vars.BUILD_MATRIX }}
+          ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
+          ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE }}
+        run: |
+          python3 - << 'PEOF'
+          import base64
+          import json
+          import os
+          import re
+          import sys
+
+          NAME_RE = re.compile(r"^(?!-)[a-z0-9._-]+$")
+          TAG_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+          ARG_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+          FROM_RE = re.compile(r"^\s*FROM\s+\S+", re.IGNORECASE | re.MULTILINE)
+          URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+          KNOWN_KEYS = {"name", "tag", "dockerfile", "context", "pre_build", "build_args", "push", "platforms"}
+          DOCKERFILE_KEYS = {"mode", "content", "url"}
+          MODES = {"inline", "url"}
+
+
+          def fail(lines):
+              for line in ([lines] if isinstance(lines, str) else lines):
+                  print(line, file=sys.stderr)
+              sys.exit(1)
+
+
+          def get(name):
+              return os.environ.get(name, "").strip()
+
+
+          def warn(msg):
+              print(f"⚠️  警告：{msg}")
+
+
+          def b64(text):
+              return base64.b64encode(text.encode()).decode()
+
+
+          def no_multiline(value, label, target):
+              if not isinstance(value, str) or not value.strip() or "\n" in value or "\r" in value:
+                  fail(f"❌ 中止：镜像 '{target}' 的 {label} 必须是单行非空字符串，实际：{value!r}")
+              return value.strip()
+
+
+          registry, namespace = get("ACR_REGISTRY"), get("ACR_NAMESPACE")
+          if not registry or not namespace:
+              fail("❌ 错误：缺少 vars.ACR_REGISTRY 或 vars.ACR_NAMESPACE 变量，请在仓库 Settings → Secrets and variables → Actions 中配置！")
+
+          matrix_str = get("BUILD_MATRIX")
+          if not matrix_str:
+              fail("❌ 错误：缺少 vars.BUILD_MATRIX 变量！请配置要构建的镜像 JSON 数组（字段说明见 README）。")
+
+          try:
+              items = json.loads(matrix_str)
+          except Exception as e:
+              fail(f"❌ 错误：vars.BUILD_MATRIX 不是合法 JSON：{e}")
+
+          if not isinstance(items, list) or not items:
+              fail("❌ 错误：vars.BUILD_MATRIX 必须是非空 JSON 数组！")
+
+          final = []
+          for idx, item in enumerate(items):
+              loc = f"vars.BUILD_MATRIX[{idx}]"
+              if not isinstance(item, dict):
+                  fail(f"❌ 中止：{loc} 不是 JSON 对象！")
+
+              dropped = sorted(set(item) - KNOWN_KEYS)
+              if dropped:
+                  warn(f"{loc} 含未知键 {dropped}，已被忽略。")
+
+              name, tag = item.get("name"), item.get("tag")
+              if not isinstance(name, str) or not NAME_RE.match(name):
+                  fail(f"❌ 中止：{loc}.name 缺失或不合法（要求匹配 ^(?-)[a-z0-9._-]+$）：{name!r}")
+              if not isinstance(tag, str) or not TAG_RE.match(tag):
+                  fail(f"❌ 中止：{loc}.tag 缺失或不合法（要求匹配 ^[a-zA-Z0-9._-]+$）：{tag!r}")
+              target = f"{name}:{tag}"
+
+              df = item.get("dockerfile")
+              if not isinstance(df, dict):
+                  fail(f"❌ 中止：镜像 '{target}' 缺少 dockerfile 对象（需含 mode 与对应字段）。")
+              df_dropped = sorted(set(df) - DOCKERFILE_KEYS)
+              if df_dropped:
+                  warn(f"镜像 '{target}' 的 dockerfile 含未知键 {df_dropped}，已被忽略。")
+
+              mode = df.get("mode")
+              if mode not in MODES:
+                  fail(f"❌ 中止：镜像 '{target}' 的 dockerfile.mode 必须是 inline / url 之一，实际：{mode!r}")
+
+              content = url = ""
+              if mode == "inline":
+                  raw_content = df.get("content")
+                  if not isinstance(raw_content, list) or not raw_content:
+                      fail(f"❌ 中止：镜像 '{target}' mode=inline 但 dockerfile.content 必须是非空字符串数组"
+                           f"（每个元素一行，末尾带逗号）：{raw_content!r}")
+                  for li, line in enumerate(raw_content):
+                      if not isinstance(line, str):
+                          fail(f"❌ 中止：镜像 '{target}' 的 dockerfile.content[{li}] 不是字符串：{line!r}")
+                      if "\n" in line or "\r" in line:
+                          fail(f"❌ 中止：镜像 '{target}' 的 dockerfile.content[{li}] 含换行符"
+                               f"（单行铁律：每元素必须是一整行，跨行 RUN 用 \\ 续行拆成多个元素）。实际：{line!r}")
+                  content = "\n".join(raw_content)
+                  if not content.strip():
+                      fail(f"❌ 中止：镜像 '{target}' mode=inline 但 dockerfile.content 没有任何有效内容。")
+                  if not FROM_RE.search(content):
+                      fail(f"❌ 中止：镜像 '{target}' 的 dockerfile.content 未包含 FROM 指令。")
+              else:  # url
+                  raw_url = df.get("url")
+                  if not isinstance(raw_url, str) or not URL_RE.match(raw_url.strip()):
+                      fail(f"❌ 中止：镜像 '{target}' mode=url 但 dockerfile.url 缺失或非 http(s) 地址：{raw_url!r}")
+                  url = raw_url.strip()
+
+              context = item.get("context", ".")
+              context = no_multiline(context, "context", target)
+              if context.startswith("/") or ".." in context.split("/"):
+                  fail(f"❌ 中止：镜像 '{target}' 的 context 必须是工作区内相对路径（不得以 / 开头或含 ..）：{context!r}")
+
+              pre_build = ""
+              raw_pre = item.get("pre_build")
+              if raw_pre is not None:
+                  if not isinstance(raw_pre, list) or not raw_pre:
+                      fail(f"❌ 中止：镜像 '{target}' 的 pre_build 必须是非空字符串数组"
+                           f"（每个元素一行，末尾带逗号）：{raw_pre!r}")
+                  for li, line in enumerate(raw_pre):
+                      if not isinstance(line, str):
+                          fail(f"❌ 中止：镜像 '{target}' 的 pre_build[{li}] 不是字符串：{line!r}")
+                      if "\n" in line or "\r" in line:
+                          fail(f"❌ 中止：镜像 '{target}' 的 pre_build[{li}] 含换行符"
+                               f"（单行铁律：每元素必须是一整行，多行命令用 \\ 续行拆分）。实际：{line!r}")
+                  pre_build = "\n".join(raw_pre)
+                  if not pre_build.strip():
+                      fail(f"❌ 中止：镜像 '{target}' 的 pre_build 没有任何有效命令。")
+
+              build_args = item.get("build_args") or {}
+              if not isinstance(build_args, dict):
+                  fail(f"❌ 中止：镜像 '{target}' 的 build_args 必须是 JSON 对象。")
+              arg_lines = []
+              for k, v in build_args.items():
+                  if not ARG_KEY_RE.match(str(k)):
+                      fail(f"❌ 中止：镜像 '{target}' 的 build_args 键不合法：{k!r}（要求匹配 ^[A-Za-z_][A-Za-z0-9_]*$）。")
+                  if isinstance(v, (dict, list)) or v is None:
+                      fail(f"❌ 中止：镜像 '{target}' 的 build_args[{k!r}] 必须是字符串或数字。")
+                  s = str(v)
+                  if "\n" in s or "\r" in s:
+                      fail(f"❌ 中止：镜像 '{target}' 的 build_args[{k!r}] 含换行符。")
+                  arg_lines.append(f"{k}={s}")
+
+              push = item.get("push", True)
+              if not isinstance(push, bool):
+                  fail(f"❌ 中止：镜像 '{target}' 的 push 必须是 JSON 布尔值 true/false，实际：{push!r}")
+
+              platforms = item.get("platforms", "linux/amd64")
+              platforms = no_multiline(platforms, "platforms", target)
+
+              final.append({
+                  "name": name,
+                  "tag": tag,
+                  "mode": mode,
+                  "dockerfile_b64": b64(content) if mode == "inline" else "",
+                  "dockerfile_url": url,
+                  "context": context,
+                  "pre_build_b64": b64(pre_build) if pre_build else "",
+                  "has_pre_build": "true" if pre_build else "false",
+                  "build_args": "\n".join(arg_lines),
+                  "push": push,
+                  "platforms": platforms,
+              })
+
+          compact = json.dumps(final, separators=(",", ":"))
+          out = os.environ.get("GITHUB_OUTPUT")
+          if out:
+              with open(out, "a") as f:
+                  f.write(f"matrix={compact}\n")
+
+          print(f"✅ BUILD_MATRIX 校验通过，共 {len(final)} 个镜像构建任务：")
+          for e in final:
+              print(f"   - {e['name']}:{e['tag']}  mode={e['mode']}  context={e['context']}  push={e['push']}  platforms={e['platforms']}  pre_build={e['has_pre_build']}")
+          PEOF
+
+  # ---- 2. 动态矩阵并发构建 ----
+  build:
+    name: build (${{ matrix.name }}:${{ matrix.tag }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          version: latest
+
+      # 展开聚合 Secret：secrets.SECRET_ENV 里的每一行 KEY=value
+      # → 注册掩码 + 写入 GITHUB_ENV（pre_build 及后续步骤可直接 $KEY 引用）
+      # → 落盘为 buildx secret 文件（Dockerfile 用 --mount=type=secret,id=SECRET_ENV 读取）
+      # 增删保密变量只需改这个 Secret，无需 commit。
+      - name: Load secret env block
+        id: secret_env
+        env:
+          SECRET_ENV: ${{ secrets.SECRET_ENV }}
+        run: |
+          set -eu
+          BLOCK_FILE="${RUNNER_TEMP:-/tmp}/secret-env"
+          : > "${BLOCK_FILE}"
+
+          if [ -z "${SECRET_ENV:-}" ]; then
+            echo "ℹ️  SECRET_ENV 未配置：本次不注入任何额外保密环境变量"
+            echo "block_file=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          DENY_RE='^(PATH|HOME|IFS|PWD|OLDPWD|SHELL|ENV|BASH_ENV|PROMPT_COMMAND|LD_PRELOAD|LD_LIBRARY_PATH|TMPDIR|GITHUB_.+|RUNNER_.+|INPUT_.+)$'
+          total=0
+          masked=0
+          lineno=0
+          while IFS= read -r line || [ -n "${line}" ]; do
+            lineno=$((lineno + 1))
+            line="${line%$'\r'}"
+            # 空行、纯空白行、# 注释行忽略
+            if [ -z "${line#"${line%%[![:space:]]*}"}" ]; then continue; fi
+            case "${line}" in '#'*) continue ;; esac
+            case "${line}" in
+              *=*) ;;
+              *) echo "::error::SECRET_ENV 第 ${lineno} 行缺少 '='，不是 KEY=value 形式（行内容已省略以免误打印敏感值）"
+                 exit 1 ;;
+            esac
+            key="${line%%=*}"
+            val="${line#*=}"
+            # 键与值均去掉首尾空白（引号不做 shell 解析，值原样保留）
+            key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+            val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+            if ! printf '%s' "${key}" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
+              echo "::error::SECRET_ENV 第 ${lineno} 行键名不合法（要求 ^[A-Za-z_][A-Za-z0-9_]*$）：${key}"
+              exit 1
+            fi
+            if printf '%s' "${key}" | grep -qE "${DENY_RE}"; then
+              echo "::error::SECRET_ENV 第 ${lineno} 行键名被禁用（会破坏 runner 环境）：${key}"
+              exit 1
+            fi
+            if [ -z "${val}" ]; then
+              echo "::warning::SECRET_ENV 键 ${key} 的值为空，未注册掩码"
+            elif [ "${#val}" -lt 4 ]; then
+              echo "::warning::SECRET_ENV 键 ${key} 的值过短（<4 字符），不注册掩码以免搅乱日志，请勿打印它"
+            else
+              echo "::add-mask::${val}"
+              masked=$((masked + 1))
+            fi
+            # 落盘供 Dockerfile mount：值加单引号（防空格/元字符被 shell 解析），内部单引号转义为 '\''
+            quoted="'${val//\'/\'\\\'\'}'"
+            printf '%s=%s\n' "${key}" "${quoted}" >> "${BLOCK_FILE}"
+            printf '%s=%s\n' "${key}" "${val}" >> "${GITHUB_ENV}"
+            total=$((total + 1))
+          done <<< "${SECRET_ENV}"
+
+          if [ "${total}" -eq 0 ]; then
+            echo "ℹ️  SECRET_ENV 已设置但没有有效条目（全部为空行或注释）"
+            echo "block_file=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "✅ SECRET_ENV 已展开：${total} 个变量（${masked} 个已注册掩码）"
+          echo "   构建期引用：RUN --mount=type=secret,id=SECRET_ENV"
+          echo "block_file=SECRET_ENV=${BLOCK_FILE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Run pre-build commands
+        if: matrix.has_pre_build == 'true'
+        env:
+          PRE_BUILD_B64: ${{ matrix.pre_build_b64 }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          set -eu
+          printf '%s' "${PRE_BUILD_B64}" | base64 -d > /tmp/pre-build.sh
+          echo "--- pre-build 命令 ---"
+          cat /tmp/pre-build.sh
+          echo "----------------------"
+          bash -e -u -o pipefail /tmp/pre-build.sh
+
+      - name: Resolve Dockerfile
+        env:
+          MODE: ${{ matrix.mode }}
+          CONTEXT_DIR: ${{ matrix.context }}
+          DOCKERFILE_B64: ${{ matrix.dockerfile_b64 }}
+          DOCKERFILE_URL: ${{ matrix.dockerfile_url }}
+        run: |
+          set -eu
+          if [ ! -d "${CONTEXT_DIR}" ]; then
+            echo "::error::context 目录不存在: ${CONTEXT_DIR}（应由 pre_build 创建，或不设 context 使用仓库根）"
+            exit 1
+          fi
+
+          BUILDER_DOCKERFILE="${CONTEXT_DIR}/Dockerfile.generated"
+          case "${MODE}" in
+            inline)
+              printf '%s' "${DOCKERFILE_B64}" | base64 -d > "${BUILDER_DOCKERFILE}"
+              ;;
+            url)
+              echo "--- 下载 Dockerfile: ${DOCKERFILE_URL}"
+              curl -fsSL --retry 3 "${DOCKERFILE_URL}" -o "${BUILDER_DOCKERFILE}"
+              ;;
+            *)
+              echo "::error::未知的 dockerfile.mode: ${MODE}"
+              exit 1
+              ;;
+          esac
+
+          if ! grep -qiE '^[[:space:]]*FROM[[:space:]]+' "${BUILDER_DOCKERFILE}"; then
+            echo "::error::Dockerfile 未包含 FROM 指令: ${BUILDER_DOCKERFILE}"
+            exit 1
+          fi
+          echo "--- Dockerfile 末尾 20 行 (${BUILDER_DOCKERFILE}) ---"
+          tail -n 20 "${BUILDER_DOCKERFILE}"
+
+          echo "BUILDER_CONTEXT=${CONTEXT_DIR}" >> "${GITHUB_ENV}"
+          echo "BUILDER_DOCKERFILE=${BUILDER_DOCKERFILE}" >> "${GITHUB_ENV}"
+
+      - name: Login to ACR
+        if: matrix.push
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push
+        timeout-minutes: ${{ fromJSON(env.BUILD_TIMEOUT_MINUTES) }}
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.BUILDER_CONTEXT }}
+          file: ${{ env.BUILDER_DOCKERFILE }}
+          platforms: ${{ matrix.platforms }}
+          push: ${{ matrix.push }}
+          provenance: false
+          sbom: false
+          secret-files: ${{ steps.secret_env.outputs.block_file }}
+          tags: >-
+            ${{ vars.ACR_REGISTRY }}/${{ vars.ACR_NAMESPACE }}/${{ matrix.name }}:${{ matrix.tag }}
+          build-args: ${{ matrix.build_args }}
